@@ -1,1 +1,6 @@
 I need to write a set of scripts that crawls my meraki networks for AP names, statuses, and alarms.  I need to have these things formatted into a report.  The report format should be a PDF.  The scope is re-framable from all aps all orgs and all networks to any combination of the three.  The report shoudl include the AP name, the network name, the model, tags, s/n, last seen timestamp, status, and alarms.
+
+
+Now we need to add a summary of AP status above each network, and a client score which summarizes the connection steps for each network.  Include the client scores in the per-AP rows that include the statuses, etc.
+
+At the end of each network report, also include a list of security related alarms like rogue ap detection, radar event patterns, etc.

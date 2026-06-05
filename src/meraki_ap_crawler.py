@@ -4,6 +4,10 @@ meraki_ap_crawler.py
 Crawls the Meraki Dashboard API and collects AP data across one or more
 scopes (all orgs, single org, or specific networks).
 
+New in this version:
+  - Per-AP client connectivity scores (association, auth, DHCP, DNS step counts)
+    fetched from the wireless client connectivity endpoint.
+
 Scope is controlled by CLI flags:
   --all-orgs                Crawl every org accessible to the API key
   --org-id  <ORG_ID>        Crawl a single org (all its networks)
@@ -23,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -42,6 +45,12 @@ Headers = dict[str, str]
 BASE_URL:    str = "https://api.meraki.com/api/v1"
 RETRY_LIMIT: int = 3
 RETRY_WAIT:  int = 5   # seconds between retries on 429 / 5xx
+
+# Lookback window for client connectivity data (seconds).  2 hours default.
+CONNECTIVITY_TIMESPAN: int = 7200
+
+# Connection steps we track, in order.
+CONNECTION_STEPS: list[str] = ["association", "auth", "dhcp", "dns"]
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +159,120 @@ def get_org_alerts(org_id: str, headers: Headers) -> list[Row]:
     print(f"  Fetching alerts for org {org_id} …")
     try:
         data = _get(f"{BASE_URL}/organizations/{org_id}/assurance/alerts", headers)
-        # API returns {"items": [...]} or a bare list depending on version
         if isinstance(data, dict):
             return data.get("items", [])
         return data
     except SystemExit:
-        # Endpoint may not be available on all dashboard tiers
         return []
+
+
+def get_network_client_connectivity(network_id: str, headers: Headers) -> list[Row]:
+    """
+    Fetch wireless client connection step data for a network.
+
+    Endpoint: GET /networks/{networkId}/wireless/clients/connectionStats
+    Returns a list of records, one per client, each with a 'connectionStats'
+    dict containing counts for: assoc, auth, dhcp, dns, success.
+
+    The AP serial is available in each record as 'apSerial' (or 'serial'
+    depending on Dashboard version).
+    """
+    print(f"      Fetching client connectivity for network {network_id} …")
+    try:
+        data = _get(
+            f"{BASE_URL}/networks/{network_id}/wireless/clients/connectionStats",
+            headers,
+            params={"timespan": CONNECTIVITY_TIMESPAN},
+        )
+        # Endpoint returns a list of per-client objects
+        if isinstance(data, list):
+            return data
+        return []
+    except SystemExit:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Client score helpers
+# ---------------------------------------------------------------------------
+
+def _empty_step_counts() -> dict[str, Any]:
+    """Zero-valued step count record for an AP with no client data."""
+    return {
+        "assoc_total":   0, "assoc_fail":   0,
+        "auth_total":    0, "auth_fail":    0,
+        "dhcp_total":    0, "dhcp_fail":    0,
+        "dns_total":     0, "dns_fail":     0,
+        "success_total": 0,
+        "client_score":  None,   # None = no data
+    }
+
+
+def _build_ap_client_scores(client_records: list[Row]) -> dict[str, dict[str, Any]]:
+    """
+    Aggregate per-client connection step counts into per-AP totals.
+
+    Returns: serial → step count dict (same shape as _empty_step_counts).
+
+    Meraki's connectionStats shape per client:
+      {
+        "mac": "...",
+        "serial": "Q2KN-...",          # AP serial
+        "connectionStats": {
+          "assoc": 5, "auth": 4, "dhcp": 4, "dns": 3, "success": 3
+        }
+      }
+    The counts represent *failed* attempts for assoc/auth/dhcp/dns and
+    *successful* connections for "success".
+    """
+    totals: dict[str, dict[str, Any]] = {}
+
+    for rec in client_records:
+        serial = rec.get("serial") or rec.get("apSerial") or ""
+        if not serial:
+            continue
+        cs = rec.get("connectionStats") or {}
+
+        if serial not in totals:
+            totals[serial] = _empty_step_counts()
+            totals[serial]["client_score"] = 0   # reset to int now we have data
+
+        t = totals[serial]
+
+        # Meraki returns fail counts for each step; success is full successes.
+        assoc_fail = int(cs.get("assoc", 0))
+        auth_fail  = int(cs.get("auth",  0))
+        dhcp_fail  = int(cs.get("dhcp",  0))
+        dns_fail   = int(cs.get("dns",   0))
+        success    = int(cs.get("success", 0))
+
+        # Total attempts per step = failures at that step + all subsequent
+        # attempts (approximation: total = fail + success for the innermost
+        # step; outer steps accumulate their own failures on top).
+        # Simpler and accurate: store raw fail counts + successes; let the
+        # report compute pass rates.
+        t["assoc_fail"] += assoc_fail
+        t["auth_fail"]  += auth_fail
+        t["dhcp_fail"]  += dhcp_fail
+        t["dns_fail"]   += dns_fail
+        t["success_total"] += success
+
+        # Total attempts = sum of all failures (each represents a drop-off
+        # at that step) plus final successes.
+        t["assoc_total"] += assoc_fail + auth_fail + dhcp_fail + dns_fail + success
+        t["auth_total"]  += auth_fail  + dhcp_fail + dns_fail  + success
+        t["dhcp_total"]  += dhcp_fail  + dns_fail  + success
+        t["dns_total"]   += dns_fail   + success
+
+    # Compute composite 0-100 client score per AP:
+    # Score = (successful connections / total association attempts) * 100
+    for serial, t in totals.items():
+        if t["assoc_total"] > 0:
+            t["client_score"] = round(t["success_total"] / t["assoc_total"] * 100, 1)
+        else:
+            t["client_score"] = None
+
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +324,10 @@ def collect_for_networks(
             print(f"      [WARN] skipping network {net_id}: {exc}")
             continue
 
+        # Fetch client connectivity for this network and build per-AP scores
+        client_records = get_network_client_connectivity(net_id, headers)
+        ap_scores = _build_ap_client_scores(client_records)
+
         for dev in devices:
             if not _is_ap(dev):
                 continue
@@ -215,7 +335,6 @@ def collect_for_networks(
             serial: str = dev.get("serial", "")
             status_rec = status_map.get(serial, {})
 
-            # Last-seen: prefer status record, fall back to device record
             last_seen_raw: str = (
                 status_rec.get("lastReportedAt")
                 or status_rec.get("lastSeenAt")
@@ -230,17 +349,30 @@ def collect_for_networks(
                 for a in alert_map.get(serial, [])
             ]
 
+            score_data = ap_scores.get(serial, _empty_step_counts())
+
             rows.append({
-                "network_name": name,
-                "network_id":   net_id,
-                "name":         dev.get("name", serial),
-                "serial":       serial,
-                "model":        dev.get("model", ""),
-                "tags":         tags,
-                "status":       status_rec.get("status", "unknown"),
-                "last_seen":    last_seen,
-                "alarms":       alarms,
-                "org_id":       org_id or "",
+                "network_name":  name,
+                "network_id":    net_id,
+                "name":          dev.get("name", serial),
+                "serial":        serial,
+                "model":         dev.get("model", ""),
+                "tags":          tags,
+                "status":        status_rec.get("status", "unknown"),
+                "last_seen":     last_seen,
+                "alarms":        alarms,
+                "org_id":        org_id or "",
+                # Client connectivity step counts
+                "assoc_total":   score_data["assoc_total"],
+                "assoc_fail":    score_data["assoc_fail"],
+                "auth_total":    score_data["auth_total"],
+                "auth_fail":     score_data["auth_fail"],
+                "dhcp_total":    score_data["dhcp_total"],
+                "dhcp_fail":     score_data["dhcp_fail"],
+                "dns_total":     score_data["dns_total"],
+                "dns_fail":      score_data["dns_fail"],
+                "success_total": score_data["success_total"],
+                "client_score":  score_data["client_score"],
             })
 
     return rows
@@ -281,8 +413,6 @@ def collect_single_org(org_id: str, headers: Headers) -> list[Row]:
 
 
 def collect_specific_networks(network_ids: list[str], headers: Headers) -> list[Row]:
-    # No org context available — statuses/alerts fetched per-device lazily.
-    # We still call the bulk endpoints if the user supplies --org-id alongside.
     return collect_for_networks(network_ids, org_id=None, headers=headers)
 
 
@@ -326,6 +456,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="ap_data.json",
         help="Path to write the collected JSON data (default: ap_data.json).",
     )
+    p.add_argument(
+        "--connectivity-timespan",
+        metavar="SECONDS",
+        type=int,
+        default=CONNECTIVITY_TIMESPAN,
+        help=f"Lookback window for client connectivity data in seconds (default: {CONNECTIVITY_TIMESPAN}).",
+    )
     return p
 
 
@@ -339,8 +476,11 @@ def main() -> None:
             "Meraki API key required. Use --api-key or set MERAKI_API_KEY."
         )
 
-    headers = _build_headers(api_key)
+    # Allow CLI override of the timespan constant
+    global CONNECTIVITY_TIMESPAN
+    CONNECTIVITY_TIMESPAN = args.connectivity_timespan
 
+    headers = _build_headers(api_key)
     started = datetime.now(timezone.utc).isoformat()
 
     if args.all_orgs:
@@ -353,8 +493,8 @@ def main() -> None:
     payload: dict[str, Any] = {
         "crawled_at": started,
         "scope": (
-            "all_orgs"          if args.all_orgs    else
-            f"org:{args.org_id}" if args.org_id     else
+            "all_orgs"               if args.all_orgs  else
+            f"org:{args.org_id}"     if args.org_id    else
             f"networks:{','.join(args.network_ids)}"
         ),
         "ap_count": len(rows),
