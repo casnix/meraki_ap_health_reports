@@ -1,0 +1,5 @@
+assoc_total = assoc_fail + auth_fail + dhcp_fail + dns_fail + success  # everyone
+auth_total  = auth_fail + dhcp_fail + dns_fail + success                # passed assoc
+dhcp_total  = dhcp_fail + dns_fail + success                            # passed auth
+dns_total   = dns_fail + success                                         # passed DHCP
+score       = success / assoc_total * 100

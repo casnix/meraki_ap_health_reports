@@ -168,23 +168,37 @@ def get_org_alerts(org_id: str, headers: Headers) -> list[Row]:
 
 def get_network_client_connectivity(network_id: str, headers: Headers) -> list[Row]:
     """
-    Fetch wireless client connection step data for a network.
+    Fetch wireless connection step data broken down per AP for a network.
 
-    Endpoint: GET /networks/{networkId}/wireless/clients/connectionStats
-    Returns a list of records, one per client, each with a 'connectionStats'
-    dict containing counts for: assoc, auth, dhcp, dns, success.
+    Endpoint: GET /networks/{networkId}/wireless/devices/connectionStats
+    Returns a list of records, one per AP serial, each with a
+    'connectionStats' dict containing counts for: assoc, auth, dhcp, dns,
+    success.
 
-    The AP serial is available in each record as 'apSerial' (or 'serial'
-    depending on Dashboard version).
+    Note: the per-CLIENT endpoint (/wireless/clients/connectionStats) does
+    NOT include an AP serial field and cannot be used for per-AP aggregation.
+    The per-DEVICE endpoint is the correct one here.
+
+    Example response record:
+      {
+        "serial": "Q2KN-XXXX-YYYY",
+        "connectionStats": {
+          "assoc": 2,     # failed at association step
+          "auth": 1,      # failed at auth step
+          "dhcp": 0,
+          "dns": 0,
+          "success": 47
+        }
+      }
     """
     print(f"      Fetching client connectivity for network {network_id} …")
     try:
         data = _get(
-            f"{BASE_URL}/networks/{network_id}/wireless/clients/connectionStats",
+            f"{BASE_URL}/networks/{network_id}/wireless/devices/connectionStats",
             headers,
             params={"timespan": CONNECTIVITY_TIMESPAN},
         )
-        # Endpoint returns a list of per-client objects
+        # Endpoint returns a list of per-device objects
         if isinstance(data, list):
             return data
         return []
@@ -208,69 +222,67 @@ def _empty_step_counts() -> dict[str, Any]:
     }
 
 
-def _build_ap_client_scores(client_records: list[Row]) -> dict[str, dict[str, Any]]:
+def _build_ap_client_scores(device_records: list[Row]) -> dict[str, dict[str, Any]]:
     """
-    Aggregate per-client connection step counts into per-AP totals.
+    Build a serial → step count dict from the per-device connectionStats
+    endpoint response.
 
-    Returns: serial → step count dict (same shape as _empty_step_counts).
-
-    Meraki's connectionStats shape per client:
+    The /wireless/devices/connectionStats endpoint returns one record per AP:
       {
-        "mac": "...",
-        "serial": "Q2KN-...",          # AP serial
+        "serial": "Q2KN-XXXX-YYYY",
         "connectionStats": {
-          "assoc": 5, "auth": 4, "dhcp": 4, "dns": 3, "success": 3
+          "assoc": 2,     # clients that failed at association
+          "auth": 1,      # clients that failed at auth
+          "dhcp": 0,      # clients that failed at DHCP
+          "dns": 0,       # clients that failed at DNS
+          "success": 47   # clients that completed all steps
         }
       }
-    The counts represent *failed* attempts for assoc/auth/dhcp/dns and
-    *successful* connections for "success".
+
+    All fail counts are independent (each client appears in exactly one
+    bucket). Total attempts = assoc + auth + dhcp + dns + success.
+    Pass rate per step = (attempts_reaching_step - fail_at_step) / attempts_reaching_step.
     """
     totals: dict[str, dict[str, Any]] = {}
 
-    for rec in client_records:
-        serial = rec.get("serial") or rec.get("apSerial") or ""
+    for rec in device_records:
+        serial = rec.get("serial") or ""
         if not serial:
             continue
         cs = rec.get("connectionStats") or {}
 
-        if serial not in totals:
-            totals[serial] = _empty_step_counts()
-            totals[serial]["client_score"] = 0   # reset to int now we have data
-
-        t = totals[serial]
-
-        # Meraki returns fail counts for each step; success is full successes.
-        assoc_fail = int(cs.get("assoc", 0))
-        auth_fail  = int(cs.get("auth",  0))
-        dhcp_fail  = int(cs.get("dhcp",  0))
-        dns_fail   = int(cs.get("dns",   0))
+        assoc_fail = int(cs.get("assoc",   0))
+        auth_fail  = int(cs.get("auth",    0))
+        dhcp_fail  = int(cs.get("dhcp",    0))
+        dns_fail   = int(cs.get("dns",     0))
         success    = int(cs.get("success", 0))
 
-        # Total attempts per step = failures at that step + all subsequent
-        # attempts (approximation: total = fail + success for the innermost
-        # step; outer steps accumulate their own failures on top).
-        # Simpler and accurate: store raw fail counts + successes; let the
-        # report compute pass rates.
-        t["assoc_fail"] += assoc_fail
-        t["auth_fail"]  += auth_fail
-        t["dhcp_fail"]  += dhcp_fail
-        t["dns_fail"]   += dns_fail
-        t["success_total"] += success
+        # Total clients that attempted each step (funnel model):
+        #   assoc_total = everyone
+        #   auth_total  = those who passed assoc
+        #   dhcp_total  = those who passed auth
+        #   dns_total   = those who passed DHCP
+        assoc_total = assoc_fail + auth_fail + dhcp_fail + dns_fail + success
+        auth_total  = auth_fail  + dhcp_fail + dns_fail  + success
+        dhcp_total  = dhcp_fail  + dns_fail  + success
+        dns_total   = dns_fail   + success
 
-        # Total attempts = sum of all failures (each represents a drop-off
-        # at that step) plus final successes.
-        t["assoc_total"] += assoc_fail + auth_fail + dhcp_fail + dns_fail + success
-        t["auth_total"]  += auth_fail  + dhcp_fail + dns_fail  + success
-        t["dhcp_total"]  += dhcp_fail  + dns_fail  + success
-        t["dns_total"]   += dns_fail   + success
+        score: float | None = (
+            round(success / assoc_total * 100, 1) if assoc_total > 0 else None
+        )
 
-    # Compute composite 0-100 client score per AP:
-    # Score = (successful connections / total association attempts) * 100
-    for serial, t in totals.items():
-        if t["assoc_total"] > 0:
-            t["client_score"] = round(t["success_total"] / t["assoc_total"] * 100, 1)
-        else:
-            t["client_score"] = None
+        totals[serial] = {
+            "assoc_total":   assoc_total,
+            "assoc_fail":    assoc_fail,
+            "auth_total":    auth_total,
+            "auth_fail":     auth_fail,
+            "dhcp_total":    dhcp_total,
+            "dhcp_fail":     dhcp_fail,
+            "dns_total":     dns_total,
+            "dns_fail":      dns_fail,
+            "success_total": success,
+            "client_score":  score,
+        }
 
     return totals
 
