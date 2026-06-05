@@ -3,3 +3,27 @@ auth_total  = auth_fail + dhcp_fail + dns_fail + success                # passed
 dhcp_total  = dhcp_fail + dns_fail + success                            # passed auth
 dns_total   = dns_fail + success                                         # passed DHCP
 score       = success / assoc_total * 100
+
+Sample JSON for data source:
+{
+      "network_name": "Your mom",
+      "network_id": "N_555555555555555555",
+      "name": "FAC-1",
+      "serial": "XXXX-DDDD-FFFF",
+      "model": "MR36",
+      "tags": [],
+      "status": "online",
+      "last_seen": "2026-06-05 16:18:45 CDT",
+      "alarms": [],
+      "org_id": "123456",
+      "assoc_total": 16,
+      "assoc_fail": 0,
+      "auth_total": 16,
+      "auth_fail": 4,
+      "dhcp_total": 12,
+      "dhcp_fail": 2,
+      "dns_total": 10,
+      "dns_fail": 0,
+      "success_total": 10,
+      "client_score": 62.5
+    }
