@@ -328,7 +328,7 @@ def _data_pages(meta: dict[str, Any], styles: dict[str, ParagraphStyle]) -> list
         ]
         rows = [header_row]
 
-        for ap in sorted(net_aps, key=lambda x: x.get("name", "").lower()):
+        for ap in sorted(net_aps, key=lambda x: (x.get("name") or "").lower()):
             status = ap.get("status", "unknown")
             sc     = status_color(status)
             alarms = ap.get("alarms", [])
@@ -340,12 +340,12 @@ def _data_pages(meta: dict[str, Any], styles: dict[str, ParagraphStyle]) -> list
             alarm_style = styles["alarm_cell"] if alarms else styles["cell_center"]
 
             row = [
-                Paragraph(ap.get("name", ""), styles["cell"]),
-                Paragraph(ap.get("serial", ""), styles["cell"]),
-                Paragraph(ap.get("model", ""), styles["cell_center"]),
+                Paragraph(ap.get("name") or "", styles["cell"]),
+                Paragraph(ap.get("serial") or "", styles["cell"]),
+                Paragraph(ap.get("model") or "", styles["cell_center"]),
                 Paragraph(tags, styles["cell"]),
                 Paragraph(status.capitalize(), styles["cell_center"]),
-                Paragraph(ap.get("last_seen", "N/A"), styles["cell"]),
+                Paragraph(ap.get("last_seen") or "N/A", styles["cell"]),
                 Paragraph(alarm_text, alarm_style),
             ]
             rows.append(row)
