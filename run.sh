@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 # Assume environment variable for token is MERAKI_API_TOKEN.
 #MERAKI_API_TOKEN=YOUR TOKEN HERE
