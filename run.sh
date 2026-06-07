@@ -13,10 +13,10 @@
 #MERAKI_HEALTH_REPORT_TO=admin@localhost
 
 # Test if we have a report stored.
-if [ -f "./json/recent.json "]; then
+if [[ -f "./json/recent.json" ]]; then
     rm ./json/recent.json
 fi
-if [ -f "./report/recent.pdf"]; then
+if [[ -f "./report/recent.pdf" ]]; then
     rm ./report/recent.pdf
 fi
 
